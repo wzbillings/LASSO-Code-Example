@@ -1,0 +1,361 @@
+---
+title: "LASSO example code"
+author: "Zane Billings"
+date: "1/30/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+old_par <- par()
+```
+
+# Setup
+
+Here are the packages we'll need to implement these code examples.
+
+```{r}
+library(glmnet)
+library(glmnetUtils)
+library(tidymodels)
+library(ISLR)
+
+data(Hitters, package = "ISLR")
+```
+
+# Preliminary fits
+
+Using the `glmnet` package, it is quite easy to fit simple LASSO models. We'll use the `hitters` data from the ISLR package for now--we can try and model the salary of baseball players based on their sports statistics.
+
+I'll do a few machine-learning-type things to make sure our models play as nice as possible, but won't check any model assumptions.
+
+1. I'll take the log of the response.
+2. There are a few missing values in the response. I'll just drop these.
+3. For simplicity, I'll exclude the categorical predictors.
+4. I'll center and scale the remaining predictors.
+
+```{r}
+# Drop miassing values.
+dat <- na.omit(Hitters)
+
+# Transform the response
+dat$Salary <- log(dat$Salary)
+
+# Drop the categorical predictors
+dat$NewLeague <- NULL
+dat$League <- NULL
+dat$Division <- NULL
+
+# Center and scale the predictors
+X <- scale(dat[,-17])
+y <- dat$Salary
+model_dat <- cbind(X |> as.data.frame(), "Salary" = y)
+
+# Check the data
+str(model_dat)
+```
+
+One practical consideration: in my opinion, we should always start fitting models with the NULL MODEL. 
+
+```{r null}
+null_fit <- lm(Salary ~ 1, data = model_dat)
+summary(null_fit)
+```
+
+Now since we have `tidymodels` loaded already, it's pretty easy to get a metric of performance, like the RMSE. We could also use, e.g. AIC, but I want to use cross-validation, so a prediction error metric will be best to compare across all models.
+
+```{r}
+yardstick::rmse_vec(truth = y, estimate = fitted(null_fit))
+```
+
+Now we can go ahead and fit the OLS model.
+
+```{r ols}
+ols_fit <- lm(Salary ~ ., data = model_dat)
+summary(ols_fit)
+yardstick::rmse_vec(truth = y, estimate = fitted(ols_fit))
+```
+
+Well, good news, the OLS model appears to be much better than the null model. That means our set of predictors actually has predictive power :)
+
+But I think we can do better, potentially using the methods we've discussed.
+
+# How to use `glmnet`
+
+The `glmnet` package is not so bad, but can be complicated to use at first.
+
+First let's consider the simple LASSO implementation.
+
+The main "workhorse" of `glmnet` is the function `glmnet::glmnet.fit()`, which can be interfaced with `glmnet::glmnet()`. The package uses the lambda/alpha parametrization of the penalty term - the parameter $\lambda$, the "penalty", determines the total amount of shrinkage. The "mixture" parameter, $\alpha$, controls the amount of L1 vs L2 penalty. When we set $\alpha = 1$, the default, we get LASSO.
+
+Let's fit the model using the default settings and see what happens.
+
+```{r lasso}
+lasso_fit <- glmnet::glmnet(x = X, y = y, alpha = 1)
+plot(lasso_fit, xvar = "lambda")
+```
+
+This plot is called the "trace plot" of lambdas. What the `glmnet` function does under the hood is fit an entire sequence of lambdas (the so-called "solution path"). We can specify our own sequence as well, but we'll ignore that for now.
+
+So we have 100 candidate models--this doesn't seem to give us any solid answers. How can we choose an optimal lambda? Fortunately `glmnet` has an easy implementation of cross validation.
+
+```{r}
+lasso_cv_fit <- glmnet::cv.glmnet(x = X, y = y, alpha = 1, nfolds = 10)
+plot(lasso_cv_fit)
+```
+
+By default, LASSO shows us the MSE instead of the RMSE. Good thing this leads to equivalent model selection, as I'm not sure how or if this can be changed. Let's get the best model.
+
+```{r}
+coef(lasso_cv_fit, lambda = "lambda.min")
+```
+
+We see that we have included 6 non-zero predictors and the intercept in the model that minimizes MSE. We can also get the model predictions. Unfortunately there's no `fitted` method, but there is a `predict` method.
+
+```{r}
+lasso_fits <- predict(lasso_cv_fit, newx = X, s = "lambda.min")
+
+# Let's look at diagnostic plots
+# par(mfrow = c(1, 2))
+# plot(lasso_fits, y, xlab = "fitted", ylab = "truth")
+# abline(a = 0, b = 1, lty = 2)
+# plot(lasso_fits, y - lasso_fits, xlab = "fitted", ylab = "residuals")
+# abline(h = 0, lty = 2)
+# par <- old_par
+
+# get the RMSE
+yardstick::rmse_vec(truth = y, estimate = lasso_fits |> as.numeric())
+```
+
+Interestingly, in this case, it looks like the LASSO does not perform any better than the OLS model we fit. In fact, if we plot the predictions from each model against each other, they are quite similar.
+
+```{r}
+plot(fitted(ols_fit), lasso_fits |> as.numeric())
+```
+
+We can fit ridge regression similarly by setting $\alpha = 0$.
+
+```{r}
+ridge_fit <- cv.glmnet(x = X, y = y, alpha = 0)
+plot(ridge_fit)
+coef(ridge_fit, lambda = "lambda.min")
+ridge_fits <- predict(ridge_fit, newx = X, s = "lambda.min")
+yardstick::rmse_vec(truth = y, estimate = ridge_fits |> as.numeric())
+```
+
+Ridge doesn't seem to do any better. Maybe elastic net will work better, or maybe I just picked a bad example dataset!
+
+## Two-parameter CV with `glmnetUtils`
+
+If we want to select the optimal alpha and lambda, the simplest way is to use the `glmnetUtils` package. Again I'll use the default settings.
+
+```{r}
+best_en_fit <- cva.glmnet(x = X, y = y)
+plot(best_en_fit)
+```
+
+Unfortunately, extracting the best parameter set is kind of a headache. So I stole a solution from stackoverflow.
+
+```{r}
+get_alpha <- function(fit) {
+  alpha <- fit$alpha
+  error <- sapply(fit$modlist, function(mod) {min(mod$cvm)})
+  alpha[which.min(error)]
+}
+
+# Get all parameters.
+get_model_params <- function(fit) {
+  alpha <- fit$alpha
+  lambdaMin <- sapply(fit$modlist, `[[`, "lambda.min")
+  lambdaSE <- sapply(fit$modlist, `[[`, "lambda.1se")
+  error <- sapply(fit$modlist, function(mod) {min(mod$cvm)})
+  best <- which.min(error)
+  data.frame(alpha = alpha[best], lambdaMin = lambdaMin[best],
+             lambdaSE = lambdaSE[best], eror = error[best])
+}
+
+get_model_params(best_en_fit)
+```
+
+According to this, the best fit we get is using LASSO with the given penalty. Unfortunately using the `glmnetUtils` function and dealing with the `cva.glmnet` object is quite irritating, so I wanted to briefly discuss a modern framework for implementing these models.
+
+## The tidymodels framework
+
+Tidymodels will at first seem much more complicated and time intensive, because each step of the process is modular.
+
+First step: set up a "workflow". We already did preprocessing for this example, but this is an easy way to bundle data (and optionally a preprocessor) with a model.
+
+```{r}
+# Create the "recipe": the data part of the model.
+en_rec <- recipe(Salary ~ ., data = model_dat)
+
+# Create the "spec": the model part of the model.
+en_spec <-
+	linear_reg(
+		penalty = tune(),
+		mixture = tune()
+	) |>
+	set_mode("regression") |>
+	set_engine("glmnet")
+
+# Bundle the two into a "workflow"
+en_wf <- workflow(
+	preprocessor = en_rec,
+	spec = en_spec
+)
+```
+
+Second step: specify which hyperparameter values we should search. The easiest way is with a simple grid, but more complicated options, maximum entropy or latin hypercube sampling, are available for searching the hyperparameter space.
+
+```{r}
+# Extract the model parameter info. This is not always necessary, but it is
+# good practice.
+en_parms <- en_wf %>%
+	parameters() %>%
+	# Finalize on the set of predictors.
+	finalize(x = X)
+
+# Create the tuning grid--this is very customizable and can be done manually,
+# but I'll use the defaults here.
+en_grid <- en_parms |>
+	grid_regular(levels = 10)
+
+expand_grid(mixture = seq(0, 1, 0.1),
+			penalty = exp(seq(0, 1, 0.1)))
+```
+
+The third step is to resample the model. Typically, it's good practice to split the data into a training set and a testing set, and to only resample the training set. But I'm going to ignore that today and resample the entire dataset. I'll use 10-fold CV, repeated 5 times. We'll also stratify on the response.
+
+This step, like the tuning grid, is also extremely flexible and allows for other resampling schemes such as bootstrapping and monte carlo CV.
+
+```{r}
+# Create resamples
+en_cv <- vfold_cv(data = model_dat, v = 5, repeats = 3, strata = Salary)
+```
+
+Now we can train the model. I'm specifically doing a grid search here to optimize the hyperparameters (the conceptually easiest method) but for more complicated models, we could also choose some other algorithms. My typical go-to method that requires little thinking is to do a small grid search using latin hypercube sampling of the parameter space (`grid_latin_hypercube()` then `tune_grid()`), and use this as the initial starting point for an iterative Bayesian tuning method which uses Gaussian process models (`tune_bayes()` function). There are also other options in the `finetune` package, like so-called racing methods and simulated annealing.
+
+```{r, message = FALSE}
+en_trained <- en_wf |>
+	tune_grid(
+		resamples = en_cv,
+		param_info = en_parms,
+		grid = en_grid,
+		metrics = yardstick::metric_set(yardstick::rmse),
+		control = control_grid(verbose = TRUE)
+	)
+```
+
+Examining the results of the model can be a bit irritating, but fortunately the `tidymodels` ecosystem provides lots of tools for looking.
+
+```{r}
+en_trained |>
+	show_best()
+```
+
+Our parameter space is very fine-grained, and it seems like we get a limit on the overall RMSE of our model. However, instead of using the "best" model, it can sometimes be wise to maximize the penalty parameter within a certain allowed boundary of the best performance--typically one standard error.
+
+```{r}
+best_parms <- en_trained |>
+	select_by_one_std_err(-penalty)
+```
+
+Now, we can finalize our model and refit on the entire data set.
+
+```{r}
+best_en_model <- en_wf |>
+	finalize_workflow(best_parms)
+
+best_en_fit <- best_en_model |>
+	fit(data = model_dat)
+```
+
+So now we have the resampling parts and selecting the best model out of the way. We are back to the standard issue of dealing with a `glmnet` model. Tidymodels provides a function to extract the `glmnet` object.
+
+```{r}
+en_glmnet <- best_en_fit |>
+	extract_fit_engine()
+
+plot(en_glmnet, xvar = "lambda")
+
+coef(en_glmnet, s = best_parms$penalty)
+```
+
+We have a relatively ridge-like mixture parameter, and we can see that only one variable was discarded.
+
+# Adaptive LASSO
+
+Fortunately, implementing adaptive LASSO in `glmnet` only requires one additional argument. Unfortunately this is not yet supported in tidymodels, so we are required to use `glmnet`'s cross validation.
+
+First, we'll calculate the weights. For simplicity, I'll just try $\gamma = 1$. Zou recommends two-dimensional cross-validation, but this is currently not supported in `glmnet`. It is possible to do it manually, but I really don't want to. I found an implementation in the package `adapt4pv`, but this package does not provide source code and I have never heard of it; it also only works for binary responses, which is not the case here. Note that we need to take off the intercept weight, as `glmnet` considers the intercept separate from the beta vector (see the paper).
+
+```{r}
+w <- as.numeric(1 / abs(coef(ols_fit)))
+w <- w[2:length(w)]
+```
+
+Now we pass these weights to the `penalty.factor` argument in `glmnet`. Note that this gets passed as a `...` argument in `cv.glmnet` and is then evaluated by the underlying call to `glmnet`.
+
+```{r}
+adapt_fit <- cv.glmnet(x = X, y = y, alpha = 1, penalty.factor = w)
+plot(adapt_fit)
+coef(adapt_fit, s = "lambda.min")
+```
+
+Let's compare the adaptive coefs to the unweighted coefs.
+
+```{r}
+coefs_data <- data.frame(
+	term = coef(adapt_fit, s = "lambda.min") |> rownames(),
+	adaweight = c(NA, w),
+	adaptive = coef(adapt_fit, s = "lambda.min") |> as.numeric(),
+	unweighted = coef(lasso_cv_fit, s = "lambda.min") |> as.numeric()
+) 
+
+plot(coefs_data[-1, ]$adaptive, coefs_data[-1, ]$unweighted)
+```
+
+The adaptive weighting produces a sparser model than the equal weighting. We could write a short loop to compare adaptive lasso coefficients for a few different values of gamma. Note that $\gamma = 0$ produces equal weighting.
+
+```{r}
+g <- seq(0, 15, 0.01)
+fit_adalasso <- function(g) {
+	w <- as.numeric(1 / (abs(coef(ols_fit)) ^ g))
+	w <- w[2:length(w)]
+	adapt_fit <- cv.glmnet(x = X, y = y, alpha = 1, penalty.factor = w)
+	res <- coef(adapt_fit, s = "lambda.min") |> as.matrix() |> as.data.frame()
+	names(res) <- g
+	return(res)
+}
+results <- purrr::map(g, fit_adalasso)
+results_df <- do.call(cbind, results) |>
+	t() |>
+	as.data.frame() |>
+	tibble::rownames_to_column(var = "gamma") |>
+	tidyr::pivot_longer(-gamma, names_to = "term", values_to = "coef") |>
+	mutate(gamma = as.numeric(gamma))
+```
+
+Now I'll plot the trajectories.
+
+```{r}
+library(ggplot2)
+results_df %>%
+	filter(term != "(Intercept)") %>%
+	ggplot(aes(x = gamma, y = coef, group = term)) +
+	geom_hline(yintercept = 0, col = "red", lty = 2) +
+	geom_line() +
+	theme_bw() +
+	scale_x_continuous(breaks = c(0, 1, 5, 10, 15), minor_breaks = c(0.1, 0.5, 1.5, 2, 3)) +
+	facet_wrap(vars(term))
+```
+
+I wanted to include this example because I think it shows an important concept: **gamma needs to be sufficiently large to ensure that trajectories are stable**. Zou recommends choosing gamma based on cross validation, but this seems like a poor choice to me. It might be better to choose gamma that is sufficiently large for estimates to converge (roughly), and apparently this needs to be quite a large gamma value.
+
+If we use this process of choosing lambda via typical cross validation, and then choosing gamma in this method, the only predictors we include in the active set at CRun and Hits--however, we don't know the true active set, so we cannot compare. Perhaps it would be better to try this in simulated conditions. It could also be best to fit without shrinkage now that we have a stable (in one particular sense) active set estimate, but again we do not know the true data generating process.
+
+# Group / Exclusive
+
+coming soon!
